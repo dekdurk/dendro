@@ -31,6 +31,7 @@ library(RColorBrewer)
 library(ggpubr)
 library(beepr)
 library(janitor)
+library(testit)
 
 ###########EMS and TOMST file cleaning################ 
 #TOMST data needs to be compiled manually in R studio - SEE BELOW EMS SECTION TO IMPORT TOMST DATA 
@@ -40,7 +41,7 @@ library(janitor)
 #by the below program and combine them together and name the columns by their tree ID
 
 # CHANGE HERE- Set the path to your folder containing the Excel files
-folder_path <- "./data/raw/tomst/MPJ/2025/07.11.25"
+folder_path <- "./data/raw/tomst/MPJ/2025/07.24.25"
 
 #read in serial number and name files - DON'T CHANGE UNLESS YOU HAVE TO
 names <- read.csv('./data/raw/tomst/MPJ/tomst_sn_names.csv', sep=',', stringsAsFactors=FALSE)
@@ -55,8 +56,6 @@ tomst <-  NULL
 
 #for loop that does all the things
 for (f in 1:length(file_list)) {
-  
-  
   tomstpath <- file_list[f] #sets new filepath to look at
   tomstfile <- read.csv(tomstpath) #reads in file
   file_name <- tools::file_path_sans_ext(basename(tomstpath)) #save file name for IDing columns
@@ -241,6 +240,8 @@ for (e in 1:length(tomstlist)) {
   tomstadj2025 <- rbind(tomstadj2025, tomstsub)
 }
 
+# tomstsub and tomsttempsub are temperary
+rm("tomstsub","tomsttempsub")
 
 ############cleaning all data at once################
 #create an empty dataset to be filled in with the cleaned data
@@ -261,7 +262,7 @@ clean_dendro_tomst_2025 <- data.frame()
 
 tree.increment.tomst.pj <- c("PHR4SAP2", "JHR4SAP3", "PSAP13", "PSAP11", "JSAP5", 
                              "JSAP6", "PCP728", "JCP738", "PCP754", "JCP292",
-                             "J20", "P20", "J21", "J22", "J23", "P21", 
+                             "J20", "P20", "J21", "J22", "J23", "P21", "J24", "J25",
                              "J26", "J27", "P22")
 
 #"J24", "J25"
@@ -269,6 +270,7 @@ tree.increment.tomst.pj <- c("PHR4SAP2", "JHR4SAP3", "PSAP13", "PSAP11", "JSAP5"
 #for loop that cycles through the trees, and cleans the data using temp data to correct for it. 
 #also detects jumps of more  than 5 militers (change in the tol_jump argument of proc_dendro_L2)
 #can take a while if you ask it to plot as well
+
 
 #tomst turn
 for (s in 1:length(tree.increment.tomst.pj)) {
@@ -284,15 +286,30 @@ for (s in 1:length(tree.increment.tomst.pj)) {
     filter(str_detect(series, "value"))
   #function that QA/QCs data and plots
   plot_path <- paste0("./output/plots/", tree)
-  dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
-  #create date column to combine with tower data
-  dendro_l2$Date <- date(dendro_l2$ts)
-  #combine with tower data
-  # output <- left_join(dendro_l2, tower, by= "Date") DK: don't need tower data
-  output <- dendro_l2
-  #store data 
-  clean_dendro_tomst <- rbind(clean_dendro_tomst, output)
+  
+  # Check that both datasets are not empty
+  if (nrow(temp_dendro) > 0 && nrow(dendro_l1) > 0) {
+    plot_path <- paste0("./output/plots/", tree)
+    dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
+    dendro_l2$Date <- date(dendro_l2$ts)
+    output <- dendro_l2
+    clean_dendro_tomst <- rbind(clean_dendro_tomst, output)
+  } else {
+    message("Skipping ", tree, " due to missing dendro or temp data")
+  }
+  # 
+  # dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
+  # #create date column to combine with tower data
+  # dendro_l2$Date <- date(dendro_l2$ts)
+  # #combine with tower data
+  # # output <- left_join(dendro_l2, tower, by= "Date") DK: don't need tower data
+  # output <- dendro_l2
+  # #store data 
+  # clean_dendro_tomst <- rbind(clean_dendro_tomst, output)
 }
+
+assert("clean_dendro_tomst is empty", 
+       nrow(clean_dendro_tomst) > 0)
 
 #tomst turn in 2025
 for (s in 1:length(tree.increment.tomst.pj)) {
@@ -308,17 +325,22 @@ for (s in 1:length(tree.increment.tomst.pj)) {
     filter(str_detect(series, "value"))
   #function that QA/QCs data and plots
   plot_path <- paste0("./output/plots/", tree, "_2025")
-  dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
-  #create date column to combine with tower data
-  dendro_l2$Date <- date(dendro_l2$ts)
-  #combine with tower data
-  # output <- left_join(dendro_l2, tower, by= "Date") dk
-  output <- dendro_l2
-  #store data
-  clean_dendro_tomst_2025 <- rbind(clean_dendro_tomst_2025, output)
-  
+  if (nrow(temp_dendro) > 0 && nrow(dendro_l1) > 0) {
+    dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
+    #create date column to combine with tower data
+    dendro_l2$Date <- date(dendro_l2$ts)
+    #combine with tower data
+    # output <- left_join(dendro_l2, tower, by= "Date") dk
+    output <- dendro_l2
+    #store data
+    clean_dendro_tomst_2025 <- rbind(clean_dendro_tomst_2025, output)
+  } else {
+    message("Skipping ", tree, " due to missing dendro or temp data")
+  }
 }
 
+assert("clean_dendro_tomst_2025 is empty", 
+       nrow(clean_dendro_tomst_2025) > 0)
 
 ##########looking at specific trees######################
 #If you want to look at a specific tree (and look at the plots that are generated from treeprocnet)
@@ -337,10 +359,9 @@ dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, plot_p
 ##################plotting all of the clean data together
 #first tomst data needs to be converted to diameter
 clean_dendro_tomst1 <- clean_dendro_tomst
-clean_dendro_tomst1$gro_yr <- ((clean_dendro_tomst1$gro_yr)) * 2 * pi
-clean_dendro_tomst1$value <- ((clean_dendro_tomst1$value)) * 2 * pi
-clean_dendro_tomst1$twd <- (clean_dendro_tomst1$twd) * 2 * pi
 clean_dendro_tomst1$dendro <- "TOMST"
+
+unique(clean_dendro_tomst1$series)
 
 #put them all together
 all_dendro <- clean_dendro_tomst1
@@ -358,9 +379,6 @@ write.csv(all_dendro, file = paste0("./data/processed/PJ_DENDRO.csv"))
 
 #2025 data's need transformations
 clean_dendro_tomst1_2025 <- clean_dendro_tomst_2025
-clean_dendro_tomst1_2025$gro_yr <- ((clean_dendro_tomst1_2025$gro_yr)) * 2 * pi
-clean_dendro_tomst1_2025$value <- ((clean_dendro_tomst1_2025$value)) * 2 * pi
-clean_dendro_tomst1_2025$twd <- (clean_dendro_tomst1_2025$twd) * 2 * pi
 clean_dendro_tomst1_2025$dendro <- "TOMST"
 
 all_dendro_2025 <- clean_dendro_tomst1_2025
@@ -403,7 +421,7 @@ gs_dendro_day <- dendro_day_zero |>
     month = month(date),
     hour = hour(ts)
   ) |>
-  filter(month %in% 3:8)
+  filter(month %in% 4:8)
 
 ci <- function(x, conf = 0.95, na.rm = TRUE) {
   if (na.rm) x <- na.omit(x)
@@ -452,5 +470,23 @@ write.csv(gs_dendro_day, file = "./data/processed/pj_dendro_daily_zero_means_1.c
 write.csv(gs_dendro_day_sum, file = "./data/processed/pj_dendro_daily_zero_means_summary_1.csv", row.names = FALSE)
 write.csv(dendro_day_zero, file = "./data/processed/pj_dendro_daily_zero_changes_1.csv", row.names = FALSE)
 
+library(ggplot2)
 
+ggplot(gs_dendro_day_sum, aes(x = hour, y = species_hour_mean, color = species)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = species_hour_low_ci,
+                  ymax = species_hour_high_ci,
+                  fill = species),
+              alpha = 0.2, color = NA) +
+  facet_wrap(~dendro) +
+  labs(
+    title = "Hourly Dendrometer Signal",
+    x = "Hour of Day",
+    y = "Mean TWD"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
 
+ ggplot(gs_dendro_day %>% filter(series %in% c("J20.value","J21.value","J22.value","J23.value","J24.value","J25.value")), aes(date, day_zero_change, color = series))+geom_point()+
+   facet_wrap(~series)
+ 
