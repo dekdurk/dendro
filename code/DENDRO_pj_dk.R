@@ -1,11 +1,11 @@
-#This script can read in the raw data files from both EMS and TOMST dendrometers (Mini32 
-#and lolly) rename columns by their tree ID and QA/QC the data using treenetproc. You can 
-#further visualize the data, export graphs using treenetproc. Further down, you can look 
-#at individual trees, or look at graphs by species, and other interesting groupings
-#and finally calculate and plot daily values that have been zeroed at midnight
+# This script can read in the raw data files from both EMS and TOMST dendrometers (Mini32
+# and lolly) rename columns by their tree ID and QA/QC the data using treenetproc. You can
+# further visualize the data, export graphs using treenetproc. Further down, you can look
+# at individual trees, or look at graphs by species, and other interesting groupings
+# and finally calculate and plot daily values that have been zeroed at midnight
 
-#This script is specifically for looking at PJ data
-#written by: Rachael Auer
+# This script is specifically for looking at PJ data
+# written by: Rachael Auer
 
 # Edited by Derek Kober July 20, 2025.
 ## removed tower data lines, and EMS lines.
@@ -13,10 +13,10 @@
 ## cleaned up some names
 ## works as of July 20, 2025. Able to run all code at once without issues.
 
-#clears work space
-rm(list=ls(all=TRUE))
+# clears work space
+rm(list = ls(all = TRUE))
 
-#read in important libraries
+# read in important libraries
 library(treenetproc)
 library(dplyr)
 library(stringr)
@@ -32,374 +32,184 @@ library(ggpubr)
 library(beepr)
 library(janitor)
 library(testit)
+library(here)
 
-###########EMS and TOMST file cleaning################ 
-#TOMST data needs to be compiled manually in R studio - SEE BELOW EMS SECTION TO IMPORT TOMST DATA 
+########### TOMST file cleaning################
+# TOMST data needs to be compiled manually in R studio - SEE BELOW EMS SECTION TO IMPORT TOMST DATA
 
-###for TOMST files that are all in one folder on the Synology drive and are the raw .xlsx files from download #######
-#####this section will read in the .xlsx files from the folder and convert them into dataframes that can be used
-#by the below program and combine them together and name the columns by their tree ID
+### for TOMST files that are all in one folder on the Synology drive and are the raw .xlsx files from download #######
+##### this section will read in the .xlsx files from the folder and convert them into dataframes that can be used
+# by the below program and combine them together and name the columns by their tree ID
 
 # CHANGE HERE- Set the path to your folder containing the Excel files
-folder_path <- "./data/raw/tomst/MPJ/2025/07.24.25"
+folder_path <- here("data/raw/tomst/MPJ/2025/10.9.25") # I want to change this so it can just download the latest from the synology drive -DK 02/11/26
 
-#read in serial number and name files - DON'T CHANGE UNLESS YOU HAVE TO
-names <- read.csv('./data/raw/tomst/MPJ/tomst_sn_names.csv', sep=',', stringsAsFactors=FALSE)
+# read in serial number and name files - DON'T CHANGE UNLESS YOU HAVE TO
+sn_tbl <- read.csv(here("data/raw/tomst/MPJ/tomst_sn_names.csv"), sep = ",", stringsAsFactors = FALSE)
 
-as.list(names)
+as.list(sn_tbl)
 
-# List all Excel files in the folder
-file_list <- list.files(folder_path, pattern = "*.csv", full.names = TRUE)
+# List all data files in the folder
+# there are "command" files that i am unsure of they do so for now, we're only looking at the data files
+# REGEX = ^data.*\\.csv$
+# -DK
+file_list <- list.files(folder_path, pattern = "^data.*\\.csv$", full.names = TRUE)
 
-#create null object to be filled with the data
-tomst <-  NULL
+# create null object to be filled with the data
+tomst <- NULL
 
-#for loop that does all the things
-for (f in 1:length(file_list)) {
-  tomstpath <- file_list[f] #sets new filepath to look at
-  tomstfile <- read.csv(tomstpath) #reads in file
-  file_name <- tools::file_path_sans_ext(basename(tomstpath)) #save file name for IDing columns
-  file_name <- substr(file_name, 6, 13) #just extract the serial number
-  new_name <- as.vector(names[names$SN == file_name,][2]) #matches serial number and saves the tree ID 
-  split <- tomstfile %>%                #split file - basically Excel's 'text to column' function
-    separate(1, c("index", "ts", "tz", "temp", "coor1", "coor2", "value", "coor3", "qf"), ";") 
-  split$value <- as.numeric(as.character(split$value)) #need to make sure values are numeric and not characters
-  split$temp <- as.numeric(as.character(split$temp)) #need to make sure values are numeric and not characters
-  split <- split %>%                    #save the important columns and rename them with their tree ID 
-    select(ts, temp, value) %>%
-    rename(setNames("value", paste(new_name, "value", sep = "."))) %>%
-    rename(setNames("temp", paste(new_name, "temp", sep = ".")))
-  
-  
-  dup <- split %>%
-    group_by(ts) %>%
-    mutate(n = n()) %>%
-    arrange(desc(n))
-  
-  #checks and removes extra values
-  if (head(dup$n, n=1) > 1) {
-    split <- dup[-1,]
-    split <- split %>%
-      arrange(ts)
+# Helper: extract SN from filename (same logic you had)
+get_sn <- function(path) {
+  tools::file_path_sans_ext(basename(path)) |> substr(6, 13)
+}
+
+# Helper: SN -> tree id lookup (no more character(0))
+get_tree_id <- function(sn, names_tbl) {
+  id <- names_tbl |>
+    filter(SN == sn) |>
+    pull(2) |>
+    first()
+  if (is.na(id) || length(id) == 0) {
+    return(NA_character_)
   }
-  
-  
-  #update/create new tomst dataframe with dendro values
-  if (is.null(tomst)) {
-    tomst <- split
-  } else { 
-    tomst <- full_join(tomst, split, by="ts")
-    
+  as.character(id)
+}
+
+# Read + clean one TOMST file -> tibble(ts, <tree>_temp, <tree>_value)
+read_one_tomst <- function(path, names_tbl) {
+  sn <- get_sn(path)
+  tree_id <- get_tree_id(sn, names_tbl)
+
+  # If we can't map SN -> tree ID, skip this file (and warn)
+  if (is.na(tree_id)) {
+    warning("Skipping file (no SN match in sn_tbl): ", basename(path), "  SN=", sn)
+    return(NULL)
   }
-  
+
+  dat <- read.csv(path, header = FALSE, stringsAsFactors = FALSE) |>
+    # split the packed first column into fields
+    separate(
+      col = 1,
+      into = c("index", "ts", "tz", "temp", "coor1", "coor2", "value", "coor3", "qf"),
+      sep = ";",
+      remove = TRUE
+    ) |>
+    transmute(
+      ts,
+      temp  = suppressWarnings(as.numeric(temp)),
+      value = suppressWarnings(as.numeric(value))
+    ) |>
+    arrange(ts) |>
+    distinct(ts, .keep_all = TRUE) |>
+    mutate(
+      ts = ymd_hm(ts, tz = "MST"),
+      tree_id = tree_id
+    )
+
+  dat
 }
 
+# Build the full dataset
+tomst <- map_dfr(file_list, read_one_tomst, names_tbl = sn_tbl) |>
+  compact() |>
+  arrange(ts)
 
+tomst_clean0 <- tomst
 
-#########QA/QC data############
-# Step 1: Time-alignment (L1)
-#for tomst date format
-tomst <- proc_L1(data=tomst, reso=15, input="wide", date_format = "%Y.%m.%d %H:%M", tz="UTC")
+# Join install dates onto each record
+tomst_clean1 <- tomst_clean0 %>%
+  left_join(sn_tbl %>% select(tree_id, install_date), by = "tree_id") |>
+  mutate(install_date = mdy(install_date)) |>
+  rename(series = tree_id)
 
-#we need to zero the values to when we installed
+# Drop trees with missing install_date (or keep and warn)
+missing_installs <- tomst_clean1 %>%
+  filter(is.na(install_date)) %>%
+  distinct(series) %>%
+  pull(series)
 
-####tomst turn!
-#start by saving under new name just in case
-tomsttest <- tomst
-#ts column needs to be converted to correct time zone
-tomsttest$ts <- as_datetime(tomsttest$ts, tz="MST")
-
-#subset to after we installed and zero the values
-
-#this dendrometer needed to be fixed after realizing it wasn't fully installed and needs to be zeroed separately
-tomstfix <- tomsttest[tomsttest$series %in% c("PHR4SAP2.temp", "PHR4SAP2.value"),]
-tomstother <- tomsttest[tomsttest$series %in% c("JCP292.temp", "JCP292.value", "JCP738.temp",
-                                                "JCP738.value", "JHR4SAP3.temp", "JHR4SAP3.value", 
-                                                "JSAP5.temp", "JSAP5.value", "JSAP6.temp", 
-                                                "JSAP6.value", "PCP728.temp", "PCP728.value", 
-                                                "PCP754.temp", "PCP754.value", "PSAP11.temp",
-                                                "PSAP11.value", "PSAP13.temp", "PSAP13.value", 
-                                                "J20.value", "J20.temp", "P20.value", "P20.temp",
-                                                "J21.value", "J21.temp", "J22.value", "J22.temp",
-                                                "J23.value", "J23.temp", "P21.value", "P21.temp", 
-                                                "J24.value", "J24.temp", "J25.value", "J25.temp",
-                                                "J26.value", "J26.temp", "J27.value", "J27.temp",
-                                                "P22.value", "P22.temp"),]
-#all other dendros subsetted to date of install
-tomstother <- tomstother[tomstother$ts >= "2024-07-12 18:30:00",]
-#subsetted to after fix
-tomstfix <- tomstfix[tomstfix$ts >= "2024-10-02 21:00:00",]
-#put back together
-tomsttest1 <- rbind(tomstfix, tomstother)
-
-#installed some dendrometers in front of thermal cameras On April 09, 2025 and need to zero these values separately
-tomst_therm <- tomsttest1[tomsttest1$series %in% c("J20.value", "J20.temp", "P20.value", "P20.temp",
-                                                   "J21.value", "J21.temp", "J22.value", "J22.temp",
-                                                   "J23.value", "J23.temp", "P21.value", "P21.temp"),]
-tomst_rest <- tomsttest1[tomsttest1$series %in% c("PHR4SAP2.temp", "PHR4SAP2.value", "JCP292.temp", 
-                                                  "JCP292.value", "JCP738.temp","JCP738.value", 
-                                                  "JHR4SAP3.temp", "JHR4SAP3.value", "JSAP5.temp", 
-                                                  "JSAP5.value", "JSAP6.temp", 
-                                                  "JSAP6.value", "PCP728.temp", "PCP728.value", 
-                                                  "PCP754.temp", "PCP754.value", "PSAP11.temp",
-                                                  "PSAP11.value", "PSAP13.temp", "PSAP13.value", 
-                                                  "J24.value", "J24.temp", "J25.value", "J25.temp",
-                                                  "J26.value", "J26.temp", "J27.value", "J27.temp",
-                                                  "P22.value", "P22.temp"),]
-#subset to after we installed
-tomst_therm <- tomst_therm[tomst_therm$ts >= "2025-04-09 7:00:00",]
-
-#put back together
-tomsttest1 <- rbind(tomst_therm, tomst_rest)
-
-
-#installed some dendrometers in front of thermal cameras On April 27, 2025 and need to zero these values separately
-tomst_therm <- tomsttest1[tomsttest1$series %in% c("J24.value", "J24.temp", "J25.value", "J25.temp",
-                                                   "J26.value", "J26.temp", "J27.value", "J27.temp",
-                                                   "P22.value", "P22.temp"),]
-tomst_rest <- tomsttest1[tomsttest1$series %in% c("PHR4SAP2.temp", "PHR4SAP2.value", "JCP292.temp", 
-                                                  "JCP292.value", "JCP738.temp","JCP738.value", 
-                                                  "JHR4SAP3.temp", "JHR4SAP3.value", "JSAP5.temp", 
-                                                  "JSAP5.value", "JSAP6.temp", 
-                                                  "JSAP6.value", "PCP728.temp", "PCP728.value", 
-                                                  "PCP754.temp", "PCP754.value", "PSAP11.temp",
-                                                  "PSAP11.value", "PSAP13.temp", "PSAP13.value", 
-                                                  "J20.value", "J20.temp", "P20.value", "P20.temp",
-                                                  "J21.value", "J21.temp", "J22.value", "J22.temp",
-                                                  "J23.value", "J23.temp", "P21.value", "P21.temp"),]
-#subset to after we installed
-tomst_therm <- tomst_therm[tomst_therm$ts >= "2025-04-27 09:15:00",]
-
-#put back together
-tomsttest1 <- rbind(tomst_therm, tomst_rest)
-
-
-#need to convert data from 15 minute to hourly - select values only at the hour
-tomsttest1$hour <- hour(tomsttest1$ts)
-tomsttest1$minute <- minute(tomsttest1$ts)
-#subset to just hour
-tomsttest1 <- tomsttest1[tomsttest1$minute == 0,]
-
-#subset to just 2025 data
-tomst2025 <- tomsttest1[tomsttest1$ts >= "2024-12-31 17:00:00",]
-
-#list of trees to cycle through to zero data
-tomstlist <- c("PHR4SAP2", "JHR4SAP3", "PSAP13", "PSAP11", "JSAP5", 
-               "JSAP6", "PCP728", "JCP738", "PCP754", "JCP292", 
-               "J20", "P20", "J21", "J22", "J23", "P21", "J24", 
-               "J25", "J26", "J27", "P22" )
-
-#empty dataframe to store data in
-tomstadj <- data.frame()
-tomstadj2025 <- data.frame()
-
-#for loop that zeros data to date of install
-for (e in 1:length(tomstlist)) {
-  #new tree
-  tree <- tomstlist[e]
-  #subset to just that trees dendro data
-  tomstsub <- tomsttest1 %>%
-    filter(str_detect(series, paste0(tree, ".value"))) 
-  #find first intial value
-  inst_val <- head(tomstsub, n=1) 
-  #subtract that value from all values
-  tomstsub <- tomstsub %>%
-    mutate(value = value - inst_val$value)
-  #get temperature data
-  tomsttempsub <- tomsttest1 %>%
-    filter(str_detect(series, paste0(tree, ".temp"))) 
-  #put back together
-  tomstsub <- rbind(tomstsub, tomsttempsub)
-  #store data in dataframe
-  tomstadj <- rbind(tomstadj, tomstsub)
+if (length(missing_installs) > 0) {
+  warning("Missing install_date for: ", paste(missing_installs, collapse = ", "))
 }
 
+# Keep only data after install_date; zero the "value" series per tree
+tomstadj <- tomst_clean1 %>%
+  filter(!is.na(install_date), ts >= install_date) %>%
+  group_by(series) %>%
+  mutate(
+    ts = format(ts, "%Y-%m-%d %H:%M:%S"), # because treenetproc hates lubridate and joy
+    baseline = first(na.omit(value)),
+    value = value - baseline
+  ) %>%
+  ungroup()
 
-#select just these columns (probably not necessary?)
-tomstadj <- tomstadj %>%
-  select("ts", "series", "value", "version")
+# treenetproc is picky and not designed well, like why do i have to separate temperature data from the value data.
+tomst_value <- tomstadj |>
+  select(ts, value, series)
 
-#2025's turn
-for (e in 1:length(tomstlist)) {
-  #new tree
-  tree <- tomstlist[e]
-  #subset to that tree's dendrometer data
-  tomstsub <- tomst2025 %>%
-    filter(str_detect(series, paste0(tree, ".value"))) 
-  #find initial value
-  inst_val <- head(tomstsub, n=1) 
-  #subtract initial value
-  tomstsub <- tomstsub %>%
-    mutate(value = value - inst_val$value)
-  #get temp data
-  tomsttempsub <- tomst2025 %>%
-    filter(str_detect(series, paste0(tree, ".temp"))) 
-  #combine back together
-  tomstsub <- rbind(tomstsub, tomsttempsub)
-  #store in dataframe
-  tomstadj2025 <- rbind(tomstadj2025, tomstsub)
-}
+tomst_temperature <- tomstadj |>
+  select(ts, temp, series) |>
+  rename(value = temp) # treenetproc being picky
 
-# tomstsub and tomsttempsub are temperary
-rm("tomstsub","tomsttempsub")
-
-############cleaning all data at once################
-#create an empty dataset to be filled in with the cleaned data
-
-clean_dendro_tomst <- data.frame(
-  series = character(),
-  ts = character(),
-  value = numeric(),
-  max = numeric(),
-  twd = numeric(),
-  gro_yr = numeric(),
-  frost = logical(),
-  flags = logical(),
-  version = character()
+tomst_value_L1 <- proc_L1(
+  data_L0 = tomst_value,
+  reso = 15,
+  tz = "MST"
 )
 
-clean_dendro_tomst_2025 <- data.frame()
+tomst_temperature_L1 <- proc_L1(
+  data_L0 = tomst_temperature,
+  reso = 15,
+  tz = "MST"
+)
 
-tree.increment.tomst.pj <- c("PHR4SAP2", "JHR4SAP3", "PSAP13", "PSAP11", "JSAP5", 
-                             "JSAP6", "PCP728", "JCP738", "PCP754", "JCP292",
-                             "J20", "P20", "J21", "J22", "J23", "P21", "J24", "J25",
-                             "J26", "J27", "P22")
+series_ids <- unique(tomst_value_L1$series)
 
-#"J24", "J25"
+multi_proc_dendro_L2 <- function(s) {
+  dendro_s <- tomst_value_L1 %>% filter(series == s)
+  temp_s <- tomst_temperature_L1 %>% filter(series == s)
 
-#for loop that cycles through the trees, and cleans the data using temp data to correct for it. 
-#also detects jumps of more  than 5 militers (change in the tol_jump argument of proc_dendro_L2)
-#can take a while if you ask it to plot as well
-
-
-#tomst turn
-for (s in 1:length(tree.increment.tomst.pj)) {
-  #new tree
-  tree <- tree.increment.tomst.pj[s]
-  #subset of that trees temp data
-  temp_dendro <- tomstadj %>%
-    filter(str_detect(series, tree)) %>%
-    filter(str_detect(series, "temp"))
-  #subset of that trees dendro data
-  dendro_l1 <- tomstadj %>%
-    filter(str_detect(series, tree)) %>%
-    filter(str_detect(series, "value"))
-  #function that QA/QCs data and plots
-  plot_path <- paste0("./output/plots/", tree)
-  
-  # Check that both datasets are not empty
-  if (nrow(temp_dendro) > 0 && nrow(dendro_l1) > 0) {
-    plot_path <- paste0("./output/plots/", tree)
-    dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
-    dendro_l2$Date <- date(dendro_l2$ts)
-    output <- dendro_l2
-    clean_dendro_tomst <- rbind(clean_dendro_tomst, output)
-  } else {
-    message("Skipping ", tree, " due to missing dendro or temp data")
+  # If something is missing, skip safely
+  if (nrow(dendro_s) == 0 || nrow(temp_s) == 0) {
+    return(NULL)
   }
-  # 
-  # dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
-  # #create date column to combine with tower data
-  # dendro_l2$Date <- date(dendro_l2$ts)
-  # #combine with tower data
-  # # output <- left_join(dendro_l2, tower, by= "Date") DK: don't need tower data
-  # output <- dendro_l2
-  # #store data 
-  # clean_dendro_tomst <- rbind(clean_dendro_tomst, output)
+
+  proc_dendro_L2(
+    dendro_L1 = dendro_s,
+    temp_L1   = temp_s, # now a single series -> no temp_ref length mismatch
+    plot      = TRUE, # set TRUE if you really want plots (it'll make one per series)
+    plot_name = paste0("output/plots/", s),
+    tz        = "MST"
+  )
 }
 
-assert("clean_dendro_tomst is empty", 
-       nrow(clean_dendro_tomst) > 0)
+dendro_data_L2 <- map_dfr(series_ids, multi_proc_dendro_L2)
 
-#tomst turn in 2025
-for (s in 1:length(tree.increment.tomst.pj)) {
-  #new tree
-  tree <- tree.increment.tomst.pj[s]
-  #subset of that trees temp data
-  temp_dendro <- tomstadj2025 %>%
-    filter(str_detect(series, tree)) %>%
-    filter(str_detect(series, "temp"))
-  #subset of that trees dendro data
-  dendro_l1 <- tomstadj2025 %>%
-    filter(str_detect(series, tree)) %>%
-    filter(str_detect(series, "value"))
-  #function that QA/QCs data and plots
-  plot_path <- paste0("./output/plots/", tree, "_2025")
-  if (nrow(temp_dendro) > 0 && nrow(dendro_l1) > 0) {
-    dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, tol_jump = 13, plot_period = "yearly", plot_export = T, plot_name = plot_path)
-    #create date column to combine with tower data
-    dendro_l2$Date <- date(dendro_l2$ts)
-    #combine with tower data
-    # output <- left_join(dendro_l2, tower, by= "Date") dk
-    output <- dendro_l2
-    #store data
-    clean_dendro_tomst_2025 <- rbind(clean_dendro_tomst_2025, output)
-  } else {
-    message("Skipping ", tree, " due to missing dendro or temp data")
-  }
+pj_dendro_all <- dendro_data_L2
+
+write.csv(pj_dendro_all, file = here("data/processed/pj_dendro.csv"))
+
+
+for (tree in unique(dendro_data_L2$series)) {
+  dat <- dendro_data_L2 |> filter(series == tree)
+  p <- ggplot(dat, aes(x = ts, y = twd)) +
+    geom_point() +
+    ggtitle(tree)
+
+  print(p)
 }
 
-assert("clean_dendro_tomst_2025 is empty", 
-       nrow(clean_dendro_tomst_2025) > 0)
-
-##########looking at specific trees######################
-#If you want to look at a specific tree (and look at the plots that are generated from treeprocnet)
-'temp_dendro <- ems %>%
-  filter(series == "HR4.Temp", value > 0)
-
-dendro_l1 <- ems %>%
-  filter(series == "HR4.Increment", value > 0) 
-
-# Step 2: Error detection and processing (L2)
-
-# Clean time-aligned (L1) dendrometer data and plot changes
-dendro_l2 <- proc_dendro_L2(dendro_L1 = dendro_l1, temp_L1 = temp_dendro, plot_period = "yearly", plot_export = F)'
 
 
-##################plotting all of the clean data together
-#first tomst data needs to be converted to diameter
-clean_dendro_tomst1 <- clean_dendro_tomst
-clean_dendro_tomst1$dendro <- "TOMST"
 
-unique(clean_dendro_tomst1$series)
 
-#put them all together
-all_dendro <- clean_dendro_tomst1
-
-#create species column
-all_dendro <- all_dendro %>%
-  mutate(species = case_when(
-    str_detect(series, "J") ~ "Juniper", 
-    str_detect(series, "P") ~ "Pinon", 
-    .default = NA
-  ))
-
-#save compiled, cleaned data to synology drive
-write.csv(all_dendro, file = paste0("./data/processed/PJ_DENDRO.csv"))
-
-#2025 data's need transformations
-clean_dendro_tomst1_2025 <- clean_dendro_tomst_2025
-clean_dendro_tomst1_2025$dendro <- "TOMST"
-
-all_dendro_2025 <- clean_dendro_tomst1_2025
+#### This section is for daily zeroed values and should be run manually because the
+# calculations take around 10 minutes (or more!) - only rerun when you want new updated plots!
+# alternatively, you can read in the previous files to make plots with the data (below)
+# gs_dendro_day <- read.csv("./Compiled Data/MPJ/PJ_DENDRO_daily_zero_means.csv", sep=',', fill=TRUE, stringsAsFactors=FALSE)
+# dendro_day_zero <- read.csv("./Compiled Data/MPJ/PJ_DENDRO_daily_zero_means.csv", sep=',', fill=TRUE, stringsAsFactors=FALSE)
 
 all_dendro_2025 <- all_dendro_2025 %>%
-  mutate(species = case_when(
-    str_detect(series, "J") ~ "Juniper", 
-    str_detect(series, "P") ~ "Pinon", 
-    .default = NA
-  ))
-
-write.csv(all_dendro_2025, file = paste0("./data/processed/PJ_DENDRO_2025.csv"))
-
-
-####This section is for daily zeroed values and should be run manually because the 
-#calculations take around 10 minutes (or more!) - only rerun when you want new updated plots! 
-#alternatively, you can read in the previous files to make plots with the data (below)
-#gs_dendro_day <- read.csv("./Compiled Data/MPJ/PJ_DENDRO_daily_zero_means.csv", sep=',', fill=TRUE, stringsAsFactors=FALSE)
-#dendro_day_zero <- read.csv("./Compiled Data/MPJ/PJ_DENDRO_daily_zero_means.csv", sep=',', fill=TRUE, stringsAsFactors=FALSE)
-
-all_dendro_2025 <- all_dendro_2025 %>% 
   clean_names()
 
 # Create series list
@@ -456,11 +266,11 @@ ggplot(gs_dendro_day, aes(x = hour, y = day_zero_change, color = species)) +
 ggsave("./output/plots/pj_daily_zero_hour_changes.png")
 
 # Plot: mean ± CI of hourly changes
-ggplot(gs_dendro_day_sum, aes(x = hour, y = species_hour_mean, color = species)) + 
+ggplot(gs_dendro_day_sum, aes(x = hour, y = species_hour_mean, color = species)) +
   geom_point(aes(size = 2)) +
   geom_line(aes(group = species, linewidth = 1.5)) +
   geom_hline(yintercept = 0, color = "black") +
-  geom_errorbar(aes(ymin = species_hour_low_ci, ymax = species_hour_high_ci), width = 0.2, linewidth = 1) + 
+  geom_errorbar(aes(ymin = species_hour_low_ci, ymax = species_hour_high_ci), width = 0.2, linewidth = 1) +
   facet_wrap(~dendro, scales = "free") +
   theme_pubr()
 ggsave("./output/plots/pj_daily_zero_means_free_scale.png")
@@ -474,10 +284,14 @@ library(ggplot2)
 
 ggplot(gs_dendro_day_sum, aes(x = hour, y = species_hour_mean, color = species)) +
   geom_line(size = 1) +
-  geom_ribbon(aes(ymin = species_hour_low_ci,
-                  ymax = species_hour_high_ci,
-                  fill = species),
-              alpha = 0.2, color = NA) +
+  geom_ribbon(
+    aes(
+      ymin = species_hour_low_ci,
+      ymax = species_hour_high_ci,
+      fill = species
+    ),
+    alpha = 0.2, color = NA
+  ) +
   facet_wrap(~dendro) +
   labs(
     title = "Hourly Dendrometer Signal",
@@ -487,6 +301,6 @@ ggplot(gs_dendro_day_sum, aes(x = hour, y = species_hour_mean, color = species))
   theme_minimal(base_size = 14) +
   theme(legend.position = "bottom")
 
- ggplot(gs_dendro_day %>% filter(series %in% c("J20.value","J21.value","J22.value","J23.value","J24.value","J25.value")), aes(date, day_zero_change, color = series))+geom_point()+
-   facet_wrap(~series)
- 
+ggplot(gs_dendro_day %>% filter(series %in% c("J20.value", "J21.value", "J22.value", "J23.value", "J24.value", "J25.value")), aes(date, day_zero_change, color = series)) +
+  geom_point() +
+  facet_wrap(~series)
