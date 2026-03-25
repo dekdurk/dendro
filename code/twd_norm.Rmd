@@ -1,0 +1,375 @@
+---
+title: "Trying TWD_norm on MPJ data"
+output:
+  html_document:
+    df_print: paged
+bibliography: references.bib
+---
+
+# Tasks
+
+-   [ ] i need to figure out the growing season window and what would be a good approach to zeroing the TWD data because without that the TWDnorm reaches values much higher than 1 (some trees are in 1000+ range)
+
+-   [ ] Something I need to think about is if TWD_predawn (min TWD before sunrise) is a good variable for TWD_norm so that TWD_norm is comparable to thermal indices.
+
+-   [ ] Add citations like: [@peters2025]
+
+# Summary
+
+apply method from Normalized tree water deficit: an automated dendrometer signal to quantify drought stress in trees by Peters et al <https://doi.org/10.1111/nph.70266>
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(here)
+library(plotly)
+library(suncalc)
+library(janitor)
+library(patchwork)
+
+```
+
+```{r globals}
+
+# MPJ site coords (edit if needed)
+MPJ_LAT <- 34.43
+MPJ_LONG <- -106.13
+
+# To make naming axises consistent and easier
+
+## TWD and MDS (µm)
+LABEL_TWD <- labs(y = "TWD (µm)")
+LABEL_TWD_PD <- labs(y = "TWD_predawn (µm)") # twd_predawn is minimum TWD value before dawn of that day
+LABEL_MDS <- labs(y = "MDS (µm)") 
+
+## Normalized TWD and MDS (Unitless)
+LABEL_TWD_NORM <- labs(y = "TWD_norm (-)") 
+LABEL_MDS_NORM <- labs(y = "MDS_norm (-)")
+
+## Timestamps
+LABEL_TS <- labs(x = "Time")
+LABEL_TS_15MIN <- labs(x = "Time (15-min)")
+LABEL_TS_DATE <- labs(x = "Date")
+
+
+```
+
+```{r load data, message=FALSE, warning=FALSE}
+
+# read pj_dendro
+twd_dat <- read_csv(here("data/processed/PJ_DENDRO.csv")) |>
+  filter(!series %in% c("JCP292","JCP738","PCP728","PCP754")) |> 
+  select(-"...1") |> 
+  mutate(
+    species = case_when(
+      str_starts(series, "J") ~ "jumo",
+      str_starts(series, "P") ~ "pied",
+      TRUE ~ NA_character_
+      )
+    )
+
+# precip for 2024-2025 should already be in data/processed/precip_24_25_daily.rds.
+# uncommment the following script if you need to do it again, or add different years, but make sure you add the needed NMEG file to the data/raw folder.
+#
+source(here("code/supp/merge_precip_24_25.R"))
+
+precip_24_25_daily <- read_rds(here("data/processed/precip_24_25_daily.rds")) 
+  
+summary(twd_dat)
+
+summary(precip_24_25_daily)
+
+```
+
+# Quick visual
+
+```{r }
+
+p <- ggplot(twd_dat, aes(x = ts, y = twd, color = series)) +
+  geom_line() + 
+  LABEL_TWD +
+  LABEL_TS_15MIN +
+  facet_wrap(~species, ncol = 1)
+
+ggplotly(p)
+
+p <- ggplot(precip_24_25_daily, aes(x = date, y = precip_daily)) +
+  geom_col() +
+  LABEL_TS_DATE +
+  labs(title = "Daily precipitation 2025", y = "total day precipitation (mm)")
+
+ggplotly(p)
+```
+
+# Normalized TWD
+
+$$
+\text{Eqn 1: } TWD_{\text{predawn,norm}} = \frac{TWD_{\text{predawn}}}{MDS_{\max}}
+$$
+
+$$
+\text{Eqn 2: } MDS_{\text{norm}} = \frac{MDS}{MDS_{\max}}
+$$
+
+## Getting MDS
+
+"MDS was extracted by analyzing daily stem radius dynamics and determining the difference between the **pre-dawn maximum stem radius** and the **minimum midday stem radius**, provided such a shrinkage cycle occurred within a 24-h period (see Knu ̈sel et al., 2021 for details). Data were restricted to the period from May to October, when stem radius changes and related physiological processes are primarily influenced by transpiration and stem rehydration, rather than by phloem collapse in winter or temperature-induced shrinking and swelling."
+
+```{r calculate MDS}
+
+dates <- seq.Date(min(as.Date(twd_dat$ts)), max(as.Date(twd_dat$ts)), by = "day")
+
+sun_times <- getSunlightTimes(
+  date = dates,
+  lat = MPJ_LAT,
+  lon = MPJ_LONG,
+  keep = c("sunrise", "solarNoon", "sunset"),
+  tz = "America/Phoenix"   # MST/MDT handled correctly
+) |>
+  mutate(date = as.Date(date)) |>
+  select(date, sunrise, solarNoon, sunset)
+
+twd_dat <- twd_dat |>
+  mutate(date = as.Date(ts)) |>
+  left_join(sun_times, by = "date") |>
+  mutate(
+    is_predawn = ts < sunrise,
+    is_midday  = ts >= solarNoon & ts <= sunset
+  )
+# i need to figure out the growning season window and what would be a good approach to zeroing this data because without that the TWDnorm reaches values much higher than 1 (some trees are in 1000+ range)
+# |> 
+#   filter(
+#     month(date)>=4,
+#     year(date) == 2025
+#     )
+
+mds_daily <- twd_dat |>
+  group_by(series, species, date) |>
+  summarise(
+    daily_max_value = if (all(!is_predawn)) NA_real_ else max(value[is_predawn], na.rm = TRUE),
+    daily_min_value = if (all(!is_midday))  NA_real_ else min(value[is_midday],  na.rm = TRUE),
+    mds = daily_max_value - daily_min_value,
+    .groups = "drop"
+  )
+
+
+p <- ggplot(mds_daily, aes(x = date, y = mds, color = series)) +
+  geom_line()+
+  facet_wrap(~species, ncol = 1) +
+  LABEL_MDS +
+  LABEL_TS_DATE +
+  labs(title = "Max Daily Shrinkage (MDS) of full timeseries", caption = "jumo = Juniperus monosperma. pied = Pinus edulis")
+
+ggplotly(p)
+
+```
+
+## TWDnorm
+
+$$
+\text{Eqn 1: } TWD_{\text{predawn,norm}} = \frac{TWD_{\text{predawn}}}{MDS_{\max}}
+$$
+
+"The patterns of soil water availability were related to **pre-dawn minimum tree water deficit** to confirm the responsiveness of the trees to soil water availability in particular measurements depths." (Steger et al., 2024) - Steger et al., 2024 was referenced in Peters et al. "Pre-dawn TWD serves as a promising indicator of whole-tree water status (Salomo ́n et al., 2022;\*\* Steger et al., 2024)"
+
+### TWDnorm full timeseries
+
+```{r TWDnorm full timeseries }
+
+# Peters et al. (2025):
+# TWDnorm = TWD_predawn / MDSmax
+# MDSnorm = MDS / MDSmax
+# with MDSmax as 99th percentile of daily MDS over the multiyear record.
+
+# Getting TWD_predawn
+# TWD_predawn is minimum TWD value before dawn of that day
+twd_daily <- twd_dat %>%
+  group_by(series, species, date) %>%
+  summarize(
+    twd_predawn = if (all(!is_predawn)) NA_real_ else min(twd[is_predawn], na.rm = TRUE),    
+    n_obs = dplyr::n(),
+    .groups = "drop"
+  )
+
+# Show TWD_predawn (minimum TWD value before dawn of that day)
+p <- ggplot(twd_daily, aes(x = date, y = twd_predawn, color = series)) +
+  geom_line()+
+  facet_wrap(~species, ncol = 1)+
+  LABEL_TWD_PD +
+  LABEL_TS_DATE 
+
+ggplotly(p)
+
+twd_mds_daily <- merge(twd_daily, mds_daily, by=c("series","species","date"))
+
+twd_norm_daily <- twd_mds_daily |> 
+  group_by(series) %>%
+  mutate(
+    mds_max = quantile(mds, probs = 0.99, na.rm = TRUE, names = FALSE, type = 7), # MDSmax as 99th percentile of daily MDS over the multiyear record of each individual series
+    twd_norm = twd_predawn / mds_max,
+    mds_norm = mds / mds_max,
+    drought_stress_onset = twd_norm >= 1
+  ) %>%
+  ungroup()
+
+precip_24_25_daily <- precip_24_25_daily |> 
+  filter(
+    date >= min(twd_daily$date),
+    date <= max(twd_daily$date)
+  )
+
+p <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+  geom_line()+
+  geom_hline(yintercept = 1)+
+  facet_wrap(~species, ncol = 1) +
+  LABEL_TWD_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Normalized TWD for full timeseries (2024-2025)")
+
+ggplotly(p)
+
+
+p1 <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  labs(title = "Normalized TWD (2024 - 2025)", y = "TWD_norm (-)")
+
+
+p2 <- ggplot(precip_24_25_daily, aes(x = date, y = precip_daily)) +
+  geom_col() +
+  LABEL_TS_DATE +
+  labs(y = "Daily precip.(mm)")
+
+# not ineractive but keeps the labels
+#p1/p2
+
+# Interactive
+subplot(
+  ggplotly(p1),
+  ggplotly(p2),
+  nrows = 2,
+  shareX = TRUE,
+  heights = c(0.75, 0.25),
+  titleY = TRUE
+)
+
+
+
+```
+
+**Remarks:**
+
+I am somewhat hesitant to interpret this graph because some dendrometer records begin in **June 2024**, meaning the calculation of ***TWD~norm~*** is incomplete for those trees.
+
+In addition, both *JUMO* and *PIED* spend long periods above the drought stress onset line and reach relatively high values (**\>5**). While it may be possible for these species to reach such values in a semi-arid environment, the maximum ***TWD~norm~*** values reported in *Peters et al.* were around **5–6** for *Abies alba*, *Picea abies*, and *Pinus sylvestris*, which occur in less arid environments.
+
+To evaluate whether this is influencing the results, I will also try zeroing the data for 2025 only (next code chuck) and recalculate ***TWD~norm~***. However, this approach removes the multi-year component of ***MDS~norm~*** and 2025 is also incomplete for several dendrometers associated with the thermal cameras (installed in **April 2025**).
+
+### TWDnorm 2025
+
+Trying for just 2025, zeroing for at Jan. 1 2025. We should note that this removes the multi-year component of the MDS
+
+```{r TWDnorm 2025}
+
+# Peters et al. (2025):
+# TWDnorm = TWD_predawn / MDSmax
+# MDSnorm = MDS / MDSmax
+# with MDSmax as 99th percentile of daily MDS over the multiyear record.
+
+
+# find baseline value at start of 2025 for each series
+baseline_2025 <- twd_dat %>%
+  filter(date >= as.Date("2025-01-01")) %>%
+  group_by(series) %>%
+  slice_min(ts, n = 1) %>%   # first measurement of 2025
+  select(series, twd_zero = twd)
+
+# subtract baseline
+twd_dat_2025 <- twd_dat %>%
+  left_join(baseline_2025, by = "series") %>%
+  mutate(
+    twd = twd - twd_zero
+  )
+
+# calculate predawn TWD
+twd_daily <- twd_dat_2025 %>%
+  filter(date >= as.Date("2025-01-01")) %>%
+  group_by(series, species, date) %>%
+  summarize(
+    twd_predawn = if (all(!is_predawn)) NA_real_ else min(twd[is_predawn], na.rm = TRUE),
+    n_obs = dplyr::n(),
+    .groups = "drop"
+  )
+
+precip_25_daily <- precip_24_25_daily |> 
+  filter(
+    date >= min(twd_daily$date),
+    date <= max(twd_daily$date)
+  )
+
+# Plot predawn TWD
+p <- ggplot(twd_daily, aes(x = date, y = twd_predawn, color = series)) +
+  geom_line() +
+  facet_wrap(~species, ncol = 1)+
+  LABEL_TWD_PD +
+  LABEL_TS_DATE +
+  labs(title = "Predawn TWD: zeroed for 2025")
+
+ggplotly(p)
+
+twd_mds_daily <- merge(twd_daily, mds_daily, by = c("series","species","date"))
+
+# get normalized values
+twd_norm_daily <- twd_mds_daily |> 
+  group_by(series) %>%
+  mutate(
+    mds_max = quantile(mds, probs = 0.99, na.rm = TRUE, names = FALSE, type = 7),
+    twd_norm = twd_predawn / mds_max,
+    mds_norm = mds / mds_max,
+    drought_stress_onset = twd_norm >= 1
+  ) %>%
+  ungroup()
+
+# Plot normalized TWD for 2025
+p <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  LABEL_TWD_NORM +
+  LABEL_TS_DATE +
+  facet_wrap(~species, ncol = 1)+ 
+  labs(title = "Normalized TWD (2025)")
+
+ggplotly(p)
+
+p1 <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  labs(title = "Normalized TWD for 2025", y = "TWD_norm (-)")
+
+
+p2 <- ggplot(precip_25_daily, aes(x = date, y = precip_daily)) +
+  geom_col() +
+  LABEL_TS_DATE +
+  labs(y = "Daily precip.(mm)")
+
+# not ineractive but keeps the labels
+p1/p2
+
+# Interactive
+subplot(
+  ggplotly(p1),
+  ggplotly(p2),
+  nrows = 2,
+  shareX = TRUE,
+  heights = c(0.75, 0.25),
+  titleY = TRUE
+)
+
+
+
+```
+
+[**Thoughts on Normalized TWD for 2025 plot:**]{.underline}
+
+This looks similar to what was shown in [@peters2025], where more drought tolerant species/conifers would reach higher ***TWD~norm~*** values. Here we see that JUMO reaches higher ***TWD~norm~*** values than PIED.
