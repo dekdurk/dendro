@@ -42,7 +42,7 @@ library(here)
 # by the below program and combine them together and name the columns by their tree ID
 
 # CHANGE HERE- Set the path to your folder containing the Excel files
-folder_path <- here("data/raw/tomst/MPJ/2025/10.9.25") # I want to change this so it can just download the latest from the synology drive -DK 02/11/26
+folder_path <- here("data/raw/tomst/MPJ/2025/03.12.26") # I want to change this so it can just download the latest from the synology drive -DK 02/11/26
 
 # read in serial number and name files - DON'T CHANGE UNLESS YOU HAVE TO
 sn_tbl <- read.csv(here("data/raw/tomst/MPJ/tomst_sn_names.csv"), sep = ",", stringsAsFactors = FALSE)
@@ -198,9 +198,6 @@ for (tree in unique(dendro_data_L2$series)) {
 
   print(p)
 }
-
-
-
 
 
 #### This section is for daily zeroed values and should be run manually because the

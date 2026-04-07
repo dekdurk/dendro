@@ -100,7 +100,27 @@ p <- ggplot(precip_24_25_daily, aes(x = date, y = precip_daily)) +
 ggplotly(p)
 ```
 
-# Normalized TWD
+# Dendro
+
+## Getting Dendrometer Stats
+
+**MDS — Maximum Daily Shrinkage**
+
+-   MDS = pre-dawn max(radius) - midday min(radius)
+
+-   Following the workflow described by Peters et al., MDS is taken from
+    the daily shrinkage cycle between the pre-dawn maximum stem radius
+    and the minimum radius later in the day.
+
+**TWD_predawn — Pre-dawn Tree Water Deficit**
+
+-   TWD_predawn = daily minimum TWD before sunrise
+
+-   This is the raw TWD term used in the Peters et al. normalization,
+    which makes it the daily TWD statistic of interest here rather than
+    midday TWD4.
+
+**Normalized metrics**
 
 $$
 \text{Eqn 1: } TWD_{\text{predawn,norm}} = \frac{TWD_{\text{predawn}}}{MDS_{\max}}
@@ -110,11 +130,17 @@ $$
 \text{Eqn 2: } MDS_{\text{norm}} = \frac{MDS}{MDS_{\max}}
 $$
 
-## Getting MDS
+-   \(MDS_{\max}\) is the 99th percentile of daily MDS for each
+    individual dendrometer series over the available record.
 
-"MDS was extracted by analyzing daily stem radius dynamics and determining the difference between the **pre-dawn maximum stem radius** and the **minimum midday stem radius**, provided such a shrinkage cycle occurred within a 24-h period (see Knu ̈sel et al., 2021 for details). Data were restricted to the period from May to October, when stem radius changes and related physiological processes are primarily influenced by transpiration and stem rehydration, rather than by phloem collapse in winter or temperature-induced shrinking and swelling."
+### Prep derivation objects
 
-```{r calculate MDS}
+Using `P2` as the worked example below because it has one of the
+longest continuous MPJ records and makes the derivation plots easy to
+follow.
+
+```{r prep derivation objects}
+example_series <- "P2"
 
 dates <- seq.Date(min(as.Date(twd_dat$ts)), max(as.Date(twd_dat$ts)), by = "day")
 
@@ -123,7 +149,7 @@ sun_times <- getSunlightTimes(
   lat = MPJ_LAT,
   lon = MPJ_LONG,
   keep = c("sunrise", "solarNoon", "sunset"),
-  tz = "America/Phoenix"   # MST/MDT handled correctly
+  tz = "America/Phoenix"
 ) |>
   mutate(date = as.Date(date)) |>
   select(date, sunrise, solarNoon, sunset)
@@ -133,243 +159,478 @@ twd_dat <- twd_dat |>
   left_join(sun_times, by = "date") |>
   mutate(
     is_predawn = ts < sunrise,
-    is_midday  = ts >= solarNoon & ts <= sunset
-  )
-# i need to figure out the growning season window and what would be a good approach to zeroing this data because without that the TWDnorm reaches values much higher than 1 (some trees are in 1000+ range)
-# |> 
-#   filter(
-#     month(date)>=4,
-#     year(date) == 2025
-#     )
-
-mds_daily <- twd_dat |>
-  group_by(series, species, date) |>
-  summarise(
-    daily_max_value = if (all(!is_predawn)) NA_real_ else max(value[is_predawn], na.rm = TRUE),
-    daily_min_value = if (all(!is_midday))  NA_real_ else min(value[is_midday],  na.rm = TRUE),
-    mds = daily_max_value - daily_min_value,
-    .groups = "drop"
+    is_midday = ts >= solarNoon & ts <= sunset
   )
 
+calc_daily_metrics <- function(data) {
+  twd_daily <- data |>
+    group_by(series, species, date) |>
+    summarise(
+      twd_predawn = if (any(is_predawn & !is.na(twd))) min(twd[is_predawn], na.rm = TRUE) else NA_real_,
+      twd_predawn_ts = if (any(is_predawn & !is.na(twd))) {
+        ts[is_predawn & !is.na(twd)][which.min(twd[is_predawn & !is.na(twd)])][1]
+      } else {
+        as.POSIXct(NA, tz = "UTC")
+      },
+      .groups = "drop"
+    )
 
-p <- ggplot(mds_daily, aes(x = date, y = mds, color = series)) +
-  geom_line()+
-  facet_wrap(~species, ncol = 1) +
-  LABEL_MDS +
-  LABEL_TS_DATE +
-  labs(title = "Max Daily Shrinkage (MDS) of full timeseries", caption = "jumo = Juniperus monosperma. pied = Pinus edulis")
+  mds_daily <- data |>
+    group_by(series, species, date) |>
+    summarise(
+      predawn_max = if (any(is_predawn & !is.na(value))) max(value[is_predawn], na.rm = TRUE) else NA_real_,
+      predawn_max_ts = if (any(is_predawn & !is.na(value))) {
+        ts[is_predawn & !is.na(value)][which.max(value[is_predawn & !is.na(value)])][1]
+      } else {
+        as.POSIXct(NA, tz = "UTC")
+      },
+      midday_min = if (any(is_midday & !is.na(value))) min(value[is_midday], na.rm = TRUE) else NA_real_,
+      midday_min_ts = if (any(is_midday & !is.na(value))) {
+        ts[is_midday & !is.na(value)][which.min(value[is_midday & !is.na(value)])][1]
+      } else {
+        as.POSIXct(NA, tz = "UTC")
+      },
+      mds = predawn_max - midday_min,
+      .groups = "drop"
+    )
 
-ggplotly(p)
+  twd_daily |>
+    left_join(mds_daily, by = c("series", "species", "date")) |>
+    group_by(series) |>
+    mutate(
+      mds_max = if (all(is.na(mds))) {
+        NA_real_
+      } else {
+        quantile(mds, probs = 0.99, na.rm = TRUE, names = FALSE, type = 7)
+      },
+      twd_norm = twd_predawn / mds_max,
+      mds_norm = mds / mds_max,
+      drought_stress_onset = twd_norm >= 1
+    ) |>
+    ungroup()
+}
 
+daily_metrics <- calc_daily_metrics(twd_dat)
+
+example_dendro <- twd_dat |>
+  filter(series == example_series) |>
+  arrange(ts)
+
+example_daily_metrics <- daily_metrics |>
+  filter(series == example_series)
+
+example_twd_predawn <- example_daily_metrics |>
+  filter(!is.na(twd_predawn_ts)) |>
+  transmute(ts = twd_predawn_ts, date, twd_predawn)
+
+example_precip_daily <- precip_24_25_daily |>
+  filter(
+    date >= min(example_daily_metrics$date, na.rm = TRUE),
+    date <= max(example_daily_metrics$date, na.rm = TRUE)
+  )
+
+p_rain_daily <- plot_ly(example_precip_daily) |>
+  add_lines(
+    x = ~date,
+    y = ~precip_daily,
+    name = "Daily precip",
+    line = list(color = "blue")
+  ) |>
+  layout(
+    yaxis = list(title = "Precip (mm)")
+  )
 ```
 
-## TWDnorm
+### How are TWD and TWD_norm derived?
 
-$$
-\text{Eqn 1: } TWD_{\text{predawn,norm}} = \frac{TWD_{\text{predawn}}}{MDS_{\max}}
-$$
+This mirrors the derivation style from the thermal-analysis notebook,
+but uses `TWD_predawn` instead of `TWD4` so the walkthrough matches the
+Peters et al. normalization workflow.
 
-"The patterns of soil water availability were related to **pre-dawn minimum tree water deficit** to confirm the responsiveness of the trees to soil water availability in particular measurements depths." (Steger et al., 2024) - Steger et al., 2024 was referenced in Peters et al. "Pre-dawn TWD serves as a promising indicator of whole-tree water status (Salomo ́n et al., 2022;\*\* Steger et al., 2024)"
-
-### TWDnorm full timeseries
-
-```{r TWDnorm full timeseries }
-
-# Peters et al. (2025):
-# TWDnorm = TWD_predawn / MDSmax
-# MDSnorm = MDS / MDSmax
-# with MDSmax as 99th percentile of daily MDS over the multiyear record.
-
-# Getting TWD_predawn
-# TWD_predawn is minimum TWD value before dawn of that day
-twd_daily <- twd_dat %>%
-  group_by(series, species, date) %>%
-  summarize(
-    twd_predawn = if (all(!is_predawn)) NA_real_ else min(twd[is_predawn], na.rm = TRUE),    
-    n_obs = dplyr::n(),
-    .groups = "drop"
+```{r derive twd norm, fig.width=12, fig.height=12}
+p_rad_growth <- plot_ly(
+  example_dendro,
+  x = ~ts, y = ~value,
+  type = "scatter", mode = "lines",
+  name = "Stem radius",
+  line = list(color = "forestgreen", width = 3)
+) |>
+  add_trace(
+    x = ~ts,
+    y = ~max,
+    name = "Max radius envelope",
+    mode = "lines",
+    fill = "tonexty",
+    fillcolor = "rgba(173, 216, 230, 0.35)",
+    line = list(color = "firebrick", width = 3)
+  ) |>
+  layout(
+    yaxis = list(title = "Stem Radius (µm)")
   )
 
-# Show TWD_predawn (minimum TWD value before dawn of that day)
-p <- ggplot(twd_daily, aes(x = date, y = twd_predawn, color = series)) +
-  geom_line()+
-  facet_wrap(~species, ncol = 1)+
-  LABEL_TWD_PD +
-  LABEL_TS_DATE 
+p_twd <- plot_ly(example_dendro) |>
+  add_lines(
+    x = ~ts,
+    y = ~twd,
+    name = "TWD",
+    line = list(color = "steelblue", width = 3)
+  ) |>
+  add_markers(
+    data = example_twd_predawn,
+    x = ~ts,
+    y = ~twd_predawn,
+    name = "TWD_predawn",
+    marker = list(color = "black", size = 7, symbol = "circle")
+  ) |>
+  layout(
+    yaxis = list(title = "TWD (µm)")
+  )
 
-ggplotly(p)
+p_twd_predawn_daily <- plot_ly(
+  example_daily_metrics,
+  x = ~date,
+  y = ~twd_predawn,
+  type = "scatter",
+  mode = "lines",
+  line = list(color = "black", width = 3),
+  name = "TWD_predawn"
+) |>
+  layout(
+    yaxis = list(title = "TWD_predawn (µm)"),
+    xaxis = list(title = "Date")
+  )
 
-twd_mds_daily <- merge(twd_daily, mds_daily, by=c("series","species","date"))
+p_raw_daily <- plot_ly(example_daily_metrics) |>
+  add_lines(
+    x = ~date,
+    y = ~twd_predawn,
+    name = "TWD_predawn",
+    line = list(color = "black", width = 3)
+  ) |>
+  add_lines(
+    x = ~date,
+    y = ~mds_max,
+    name = "MDSmax (99th percentile)",
+    line = list(color = "red", width = 2, dash = "dash")
+  ) |>
+  layout(
+    yaxis = list(title = "Raw metric (µm)"),
+    xaxis = list(title = "Date")
+  )
 
-twd_norm_daily <- twd_mds_daily |> 
-  group_by(series) %>%
-  mutate(
-    mds_max = quantile(mds, probs = 0.99, na.rm = TRUE, names = FALSE, type = 7), # MDSmax as 99th percentile of daily MDS over the multiyear record of each individual series
-    twd_norm = twd_predawn / mds_max,
-    mds_norm = mds / mds_max,
-    drought_stress_onset = twd_norm >= 1
-  ) %>%
-  ungroup()
+p_twd_norm_example <- plot_ly(
+  example_daily_metrics,
+  x = ~date,
+  y = ~twd_norm,
+  type = "scatter",
+  mode = "lines",
+  line = list(color = "black", width = 3),
+  name = "TWD_norm"
+) |>
+  add_lines(
+    x = ~date,
+    y = ~rep(1, nrow(example_daily_metrics)),
+    name = "TWD_norm = 1",
+    line = list(color = "red", width = 2, dash = "dash")
+  ) |>
+  layout(
+    yaxis = list(title = "TWD_norm (-)"),
+    xaxis = list(title = "Date")
+  )
 
-precip_24_25_daily <- precip_24_25_daily |> 
+fig <- subplot(
+  p_rad_growth,
+  p_twd,
+  p_twd_predawn_daily,
+  p_raw_daily,
+  p_twd_norm_example,
+  p_rain_daily,
+  nrows = 6,
+  shareX = TRUE,
+  titleY = TRUE
+) |>
+  layout(
+    xaxis = list(title = "Time")
+  )
+
+fig
+```
+
+### How is MDS and MDS_norm derived?
+
+The same daily windows can be reused for MDS: select the pre-dawn
+maximum radius, select the midday minimum radius, take the difference,
+and then divide by the same \(MDS_{\max}\) used above.
+
+```{r derive mds norm, fig.width=12, fig.height=12}
+p_mds_points <- plot_ly(example_dendro) |>
+  add_lines(
+    x = ~ts,
+    y = ~value,
+    name = "Stem radius",
+    line = list(color = "forestgreen", width = 3)
+  ) |>
+  add_markers(
+    data = example_daily_metrics,
+    x = ~predawn_max_ts,
+    y = ~predawn_max,
+    marker = list(color = "red", size = 7),
+    name = "Predawn max"
+  ) |>
+  add_markers(
+    data = example_daily_metrics,
+    x = ~midday_min_ts,
+    y = ~midday_min,
+    marker = list(color = "blue", size = 7),
+    name = "Midday min"
+  ) |>
+  layout(
+    yaxis = list(title = "Stem Radius (µm)")
+  )
+
+p_mds_daily <- plot_ly(
+  example_daily_metrics,
+  x = ~date,
+  y = ~mds,
+  type = "scatter",
+  mode = "lines",
+  line = list(color = "purple", width = 3),
+  name = "MDS"
+) |>
+  add_lines(
+    x = ~date,
+    y = ~mds_max,
+    name = "MDSmax (99th percentile)",
+    line = list(color = "red", width = 2, dash = "dash")
+  ) |>
+  layout(
+    yaxis = list(title = "MDS (µm)"),
+    xaxis = list(title = "Date")
+  )
+
+p_mds_norm_example <- plot_ly(
+  example_daily_metrics,
+  x = ~date,
+  y = ~mds_norm,
+  type = "scatter",
+  mode = "lines",
+  line = list(color = "purple", width = 3),
+  name = "MDS_norm"
+) |>
+  add_lines(
+    x = ~date,
+    y = ~rep(1, nrow(example_daily_metrics)),
+    name = "MDS_norm = 1",
+    line = list(color = "red", width = 2, dash = "dash")
+  ) |>
+  layout(
+    yaxis = list(title = "MDS_norm (-)"),
+    xaxis = list(title = "Date")
+  )
+
+fig <- subplot(
+  p_mds_points,
+  p_mds_daily,
+  p_mds_norm_example,
+  p_rain_daily,
+  nrows = 4,
+  shareX = TRUE,
+  titleY = TRUE
+) |>
+  layout(
+    xaxis = list(title = "Time")
+  )
+
+fig
+```
+
+### TWD_predawn and MDS together
+
+```{r twd and mds together, fig.width=12, fig.height=12}
+fig <- subplot(
+  p_rad_growth,
+  p_twd,
+  p_twd_predawn_daily,
+  p_mds_daily,
+  p_twd_norm_example,
+  p_mds_norm_example,
+  p_rain_daily,
+  nrows = 7,
+  shareX = TRUE,
+  titleY = TRUE
+) |>
+  layout(
+    xaxis = list(title = "Time")
+  )
+
+fig
+```
+
+# Normalized Metrics
+
+### Full timeseries across all dendrometers
+
+```{r normalized full timeseries}
+metrics_full <- daily_metrics |>
   filter(
-    date >= min(twd_daily$date),
-    date <= max(twd_daily$date)
+    date >= min(daily_metrics$date, na.rm = TRUE),
+    date <= max(daily_metrics$date, na.rm = TRUE)
   )
 
-p <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
-  geom_line()+
-  geom_hline(yintercept = 1)+
-  facet_wrap(~species, ncol = 1) +
-  LABEL_TWD_NORM +
-  LABEL_TS_DATE +
-  labs(title = "Normalized TWD for full timeseries (2024-2025)")
+precip_full_daily <- precip_24_25_daily |>
+  filter(
+    date >= min(metrics_full$date, na.rm = TRUE),
+    date <= max(metrics_full$date, na.rm = TRUE)
+  )
 
-ggplotly(p)
-
-
-p1 <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+p_twd_norm_all <- ggplot(metrics_full, aes(x = date, y = twd_norm, color = series)) +
   geom_line() +
   geom_hline(yintercept = 1) +
   facet_wrap(~species, ncol = 1) +
-  labs(title = "Normalized TWD (2024 - 2025)", y = "TWD_norm (-)")
+  LABEL_TWD_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Normalized TWD for full timeseries")
 
+ggplotly(p_twd_norm_all)
 
-p2 <- ggplot(precip_24_25_daily, aes(x = date, y = precip_daily)) +
+p_mds_norm_all <- ggplot(metrics_full, aes(x = date, y = mds_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  LABEL_MDS_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Normalized MDS for full timeseries")
+
+ggplotly(p_mds_norm_all)
+
+p1 <- ggplot(metrics_full, aes(x = date, y = twd_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  labs(title = "Normalized TWD (full record)", y = "TWD_norm (-)")
+
+p2 <- ggplot(metrics_full, aes(x = date, y = mds_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  labs(title = "Normalized MDS (full record)", y = "MDS_norm (-)")
+
+p3 <- ggplot(precip_full_daily, aes(x = date, y = precip_daily)) +
   geom_col() +
   LABEL_TS_DATE +
-  labs(y = "Daily precip.(mm)")
+  labs(y = "Daily precip. (mm)")
 
-# not ineractive but keeps the labels
-#p1/p2
-
-# Interactive
 subplot(
   ggplotly(p1),
   ggplotly(p2),
-  nrows = 2,
+  ggplotly(p3),
+  nrows = 3,
   shareX = TRUE,
-  heights = c(0.75, 0.25),
+  heights = c(0.4, 0.4, 0.2),
   titleY = TRUE
 )
-
-
-
 ```
 
 **Remarks:**
 
-I am somewhat hesitant to interpret this graph because some dendrometer records begin in **June 2024**, meaning the calculation of ***TWD~norm~*** is incomplete for those trees.
+I am still somewhat hesitant to over-interpret the full-record plots
+because several dendrometer records begin after July 2024, which means
+their estimate of \(MDS_{\max}\) is still based on an incomplete record.
 
-In addition, both *JUMO* and *PIED* spend long periods above the drought stress onset line and reach relatively high values (**\>5**). While it may be possible for these species to reach such values in a semi-arid environment, the maximum ***TWD~norm~*** values reported in *Peters et al.* were around **5–6** for *Abies alba*, *Picea abies*, and *Pinus sylvestris*, which occur in less arid environments.
+The derivation figures above help show why large normalized values are
+possible here: if pre-dawn TWD stays elevated while \(MDS_{\max}\)
+remains relatively modest, then both `TWD_norm` and `MDS_norm` can stay
+well above 1 for long periods.
 
-To evaluate whether this is influencing the results, I will also try zeroing the data for 2025 only (next code chuck) and recalculate ***TWD~norm~***. However, this approach removes the multi-year component of ***MDS~norm~*** and 2025 is also incomplete for several dendrometers associated with the thermal cameras (installed in **April 2025**).
+### 2025-only zeroing
 
-### TWDnorm 2025
+Trying the same workflow after zeroing each series at its first 2025
+measurement. This is useful as a sensitivity test, but it removes the
+multi-year framing of \(MDS_{\max}\).
 
-Trying for just 2025, zeroing for at Jan. 1 2025. We should note that this removes the multi-year component of the MDS
-
-```{r TWDnorm 2025}
-
-# Peters et al. (2025):
-# TWDnorm = TWD_predawn / MDSmax
-# MDSnorm = MDS / MDSmax
-# with MDSmax as 99th percentile of daily MDS over the multiyear record.
-
-
-# find baseline value at start of 2025 for each series
-baseline_2025 <- twd_dat %>%
-  filter(date >= as.Date("2025-01-01")) %>%
-  group_by(series) %>%
-  slice_min(ts, n = 1) %>%   # first measurement of 2025
+```{r normalized 2025}
+baseline_2025 <- twd_dat |>
+  filter(date >= as.Date("2025-01-01")) |>
+  group_by(series) |>
+  slice_min(ts, n = 1, with_ties = FALSE) |>
   select(series, twd_zero = twd)
 
-# subtract baseline
-twd_dat_2025 <- twd_dat %>%
-  left_join(baseline_2025, by = "series") %>%
+twd_dat_2025 <- twd_dat |>
+  left_join(baseline_2025, by = "series") |>
   mutate(
     twd = twd - twd_zero
-  )
+  ) |>
+  filter(date >= as.Date("2025-01-01"))
 
-# calculate predawn TWD
-twd_daily <- twd_dat_2025 %>%
-  filter(date >= as.Date("2025-01-01")) %>%
-  group_by(series, species, date) %>%
-  summarize(
-    twd_predawn = if (all(!is_predawn)) NA_real_ else min(twd[is_predawn], na.rm = TRUE),
-    n_obs = dplyr::n(),
-    .groups = "drop"
-  )
+daily_metrics_2025 <- calc_daily_metrics(twd_dat_2025)
 
-precip_25_daily <- precip_24_25_daily |> 
+precip_25_daily <- precip_24_25_daily |>
   filter(
-    date >= min(twd_daily$date),
-    date <= max(twd_daily$date)
+    date >= min(daily_metrics_2025$date, na.rm = TRUE),
+    date <= max(daily_metrics_2025$date, na.rm = TRUE)
   )
 
-# Plot predawn TWD
-p <- ggplot(twd_daily, aes(x = date, y = twd_predawn, color = series)) +
+p_twd_predawn_2025 <- ggplot(daily_metrics_2025, aes(x = date, y = twd_predawn, color = series)) +
   geom_line() +
-  facet_wrap(~species, ncol = 1)+
+  facet_wrap(~species, ncol = 1) +
   LABEL_TWD_PD +
   LABEL_TS_DATE +
-  labs(title = "Predawn TWD: zeroed for 2025")
+  labs(title = "Predawn TWD after 2025 zeroing")
 
-ggplotly(p)
+ggplotly(p_twd_predawn_2025)
 
-twd_mds_daily <- merge(twd_daily, mds_daily, by = c("series","species","date"))
-
-# get normalized values
-twd_norm_daily <- twd_mds_daily |> 
-  group_by(series) %>%
-  mutate(
-    mds_max = quantile(mds, probs = 0.99, na.rm = TRUE, names = FALSE, type = 7),
-    twd_norm = twd_predawn / mds_max,
-    mds_norm = mds / mds_max,
-    drought_stress_onset = twd_norm >= 1
-  ) %>%
-  ungroup()
-
-# Plot normalized TWD for 2025
-p <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+p_twd_norm_2025 <- ggplot(daily_metrics_2025, aes(x = date, y = twd_norm, color = series)) +
   geom_line() +
   geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
   LABEL_TWD_NORM +
   LABEL_TS_DATE +
-  facet_wrap(~species, ncol = 1)+ 
-  labs(title = "Normalized TWD (2025)")
+  labs(title = "Normalized TWD after 2025 zeroing")
 
-ggplotly(p)
+ggplotly(p_twd_norm_2025)
 
-p1 <- ggplot(twd_norm_daily, aes(x = date, y = twd_norm, color = series)) +
+p_mds_norm_2025 <- ggplot(daily_metrics_2025, aes(x = date, y = mds_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  LABEL_MDS_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Normalized MDS after 2025 zeroing")
+
+ggplotly(p_mds_norm_2025)
+
+p1 <- ggplot(daily_metrics_2025, aes(x = date, y = twd_norm, color = series)) +
   geom_line() +
   geom_hline(yintercept = 1) +
   facet_wrap(~species, ncol = 1) +
   labs(title = "Normalized TWD for 2025", y = "TWD_norm (-)")
 
+p2 <- ggplot(daily_metrics_2025, aes(x = date, y = mds_norm, color = series)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  facet_wrap(~species, ncol = 1) +
+  labs(title = "Normalized MDS for 2025", y = "MDS_norm (-)")
 
-p2 <- ggplot(precip_25_daily, aes(x = date, y = precip_daily)) +
+p3 <- ggplot(precip_25_daily, aes(x = date, y = precip_daily)) +
   geom_col() +
   LABEL_TS_DATE +
-  labs(y = "Daily precip.(mm)")
+  labs(y = "Daily precip. (mm)")
 
-# not ineractive but keeps the labels
-p1/p2
-
-# Interactive
 subplot(
   ggplotly(p1),
   ggplotly(p2),
-  nrows = 2,
+  ggplotly(p3),
+  nrows = 3,
   shareX = TRUE,
-  heights = c(0.75, 0.25),
+  heights = c(0.4, 0.4, 0.2),
   titleY = TRUE
 )
-
-
-
 ```
 
-[**Thoughts on Normalized TWD for 2025 plot:**]{.underline}
+[**Thoughts on the 2025-only view:**]{.underline}
 
-This looks similar to what was shown in [@peters2025], where more drought tolerant species/conifers would reach higher ***TWD~norm~*** values. Here we see that JUMO reaches higher ***TWD~norm~*** values than PIED.
+This sensitivity check should make it easier to judge how much of the
+very large normalized values are coming from the cumulative TWD baseline
+versus the within-2025 stem-radius dynamics themselves. It also gives a
+matched view of `TWD_norm` and `MDS_norm`, which was missing from the
+earlier version of this notebook.
