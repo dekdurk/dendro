@@ -26,6 +26,8 @@ library(suncalc)
 library(janitor)
 library(patchwork)
 
+source(here("code/supp/mpj_time_utils.R"))
+
 ```
 
 ```{r globals}
@@ -57,6 +59,7 @@ LABEL_TS_DATE <- labs(x = "Date")
 
 # read pj_dendro
 twd_dat <- read_csv(here("data/processed/PJ_DENDRO.csv")) |>
+  mutate(ts = relabel_mpj_wall_time(ts)) |>
   filter(!series %in% c("JCP292","JCP738","PCP728","PCP754")) |> 
   select(-"...1") |> 
   mutate(
@@ -149,7 +152,7 @@ sun_times <- getSunlightTimes(
   lat = MPJ_LAT,
   lon = MPJ_LONG,
   keep = c("sunrise", "solarNoon", "sunset"),
-  tz = "America/Phoenix"
+  tz = MPJ_SOLAR_TZ
 ) |>
   mutate(date = as.Date(date)) |>
   select(date, sunrise, solarNoon, sunset)
@@ -170,7 +173,7 @@ calc_daily_metrics <- function(data) {
       twd_predawn_ts = if (any(is_predawn & !is.na(twd))) {
         ts[is_predawn & !is.na(twd)][which.min(twd[is_predawn & !is.na(twd)])][1]
       } else {
-        as.POSIXct(NA, tz = "UTC")
+        as.POSIXct(NA, tz = MPJ_FIXED_TZ)
       },
       .groups = "drop"
     )
@@ -182,13 +185,13 @@ calc_daily_metrics <- function(data) {
       predawn_max_ts = if (any(is_predawn & !is.na(value))) {
         ts[is_predawn & !is.na(value)][which.max(value[is_predawn & !is.na(value)])][1]
       } else {
-        as.POSIXct(NA, tz = "UTC")
+        as.POSIXct(NA, tz = MPJ_FIXED_TZ)
       },
       midday_min = if (any(is_midday & !is.na(value))) min(value[is_midday], na.rm = TRUE) else NA_real_,
       midday_min_ts = if (any(is_midday & !is.na(value))) {
         ts[is_midday & !is.na(value)][which.min(value[is_midday & !is.na(value)])][1]
       } else {
-        as.POSIXct(NA, tz = "UTC")
+        as.POSIXct(NA, tz = MPJ_FIXED_TZ)
       },
       mds = predawn_max - midday_min,
       .groups = "drop"
@@ -625,6 +628,9 @@ subplot(
   heights = c(0.4, 0.4, 0.2),
   titleY = TRUE
 )
+
+
+
 ```
 
 [**Thoughts on the 2025-only view:**]{.underline}
@@ -634,3 +640,93 @@ very large normalized values are coming from the cumulative TWD baseline
 versus the within-2025 stem-radius dynamics themselves. It also gives a
 matched view of `TWD_norm` and `MDS_norm`, which was missing from the
 earlier version of this notebook.
+
+# Norm Species averaged
+
+Here the species-level normalized metrics are calculated by averaging the
+sub-daily dendrometer signal within each species first, then deriving
+`TWD_predawn`, `MDS`, `TWD_norm`, and `MDS_norm` from that averaged
+species time series.
+
+```{r Norm Species averaged}
+
+bad_tomsts <- c("P13","J21","J23")
+
+twd_dat_species_mean <- twd_dat |>
+  filter(!series %in% bad_tomsts) |> 
+  group_by(species, ts, date, sunrise, solarNoon, sunset) |>
+  summarise(
+    value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(species, ts) |>
+  group_by(species) |>
+  mutate(
+    series = species,
+    max = cummax(value),
+    twd = max - value,
+    is_predawn = ts < sunrise,
+    is_midday = ts >= solarNoon & ts <= sunset
+  ) |>
+  ungroup()
+
+species_metrics_full <- calc_daily_metrics(twd_dat_species_mean)
+
+precip_species_daily <- precip_24_25_daily |>
+  filter(
+    date >= min(species_metrics_full$date, na.rm = TRUE),
+    date <= max(species_metrics_full$date, na.rm = TRUE)
+  )
+
+p_species_twd <- ggplot(twd_dat_species_mean, aes(x = ts, y = twd, color = species)) +
+  geom_line() +
+  LABEL_TWD +
+  LABEL_TS_15MIN +
+  labs(title = "Species-averaged TWD before daily metric derivation")
+
+ggplotly(p_species_twd)
+
+p_species_twd_norm <- ggplot(species_metrics_full, aes(x = date, y = twd_norm, color = species)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  LABEL_TWD_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Species-averaged TWD_norm")
+
+ggplotly(p_species_twd_norm)
+
+p_species_mds_norm <- ggplot(species_metrics_full, aes(x = date, y = mds_norm, color = species)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  LABEL_MDS_NORM +
+  LABEL_TS_DATE +
+  labs(title = "Species-averaged MDS_norm")
+
+ggplotly(p_species_mds_norm)
+
+p1 <- ggplot(species_metrics_full, aes(x = date, y = twd_norm, color = species)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Species-averaged TWD_norm", y = "TWD_norm (-)")
+
+p2 <- ggplot(species_metrics_full, aes(x = date, y = mds_norm, color = species)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Species-averaged MDS_norm", y = "MDS_norm (-)")
+
+p3 <- ggplot(precip_species_daily, aes(x = date, y = precip_daily)) +
+  geom_col() +
+  LABEL_TS_DATE +
+  labs(y = "Daily precip. (mm)")
+
+subplot(
+  ggplotly(p1),
+  ggplotly(p2),
+  ggplotly(p3),
+  nrows = 3,
+  shareX = TRUE,
+  heights = c(0.4, 0.4, 0.2),
+  titleY = TRUE
+)
+
+```

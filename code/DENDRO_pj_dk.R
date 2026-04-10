@@ -34,6 +34,8 @@ library(janitor)
 library(testit)
 library(here)
 
+source(here("code/supp/mpj_time_utils.R"))
+
 ########### TOMST file cleaning################
 # TOMST data needs to be compiled manually in R studio - SEE BELOW EMS SECTION TO IMPORT TOMST DATA
 
@@ -86,7 +88,7 @@ read_one_tomst <- function(path, names_tbl) {
     return(NULL)
   }
 
-  dat <- read.csv(path, header = FALSE, stringsAsFactors = FALSE) |>
+  dat_raw <- read.csv(path, header = FALSE, stringsAsFactors = FALSE) |>
     # split the packed first column into fields
     separate(
       col = 1,
@@ -95,16 +97,39 @@ read_one_tomst <- function(path, names_tbl) {
       remove = TRUE
     ) |>
     transmute(
-      ts,
-      temp  = suppressWarnings(as.numeric(temp)),
+      ts_utc = ts,
+      tz_quarters = suppressWarnings(as.numeric(tz)),
+      temp = suppressWarnings(as.numeric(temp)),
       value = suppressWarnings(as.numeric(value))
     ) |>
+    mutate(
+      ts = parse_tomst_utc_timestamp(ts_utc, tz_quarters)
+    )
+
+  dat <- dat_raw |>
     arrange(ts) |>
     distinct(ts, .keep_all = TRUE) |>
     mutate(
-      ts = ymd_hm(ts, tz = "MST"),
       tree_id = tree_id
+    ) |>
+    select(ts, temp, value, tree_id)
+
+  unexpected_offsets <- dat_raw |>
+    distinct(tz_quarters) |>
+    filter(!is.na(tz_quarters), tz_quarters != MPJ_TOMST_DEFAULT_OFFSET_QUARTERS) |>
+    pull(tz_quarters)
+
+  if (length(unexpected_offsets) > 0) {
+    warning(
+      "Unexpected TOMST timezone offsets in ",
+      basename(path),
+      ": ",
+      paste(unexpected_offsets, collapse = ", "),
+      ". Expected quarter-hour offset ",
+      MPJ_TOMST_DEFAULT_OFFSET_QUARTERS,
+      "."
     )
+  }
 
   dat
 }
@@ -137,7 +162,7 @@ tomstadj <- tomst_clean1 %>%
   filter(!is.na(install_date), ts >= install_date) %>%
   group_by(series) %>%
   mutate(
-    ts = format(ts, "%Y-%m-%d %H:%M:%S"), # because treenetproc hates lubridate and joy
+    ts = format_mpj_wall_time(ts), # treenetproc expects local wall time strings
     baseline = first(na.omit(value)),
     value = value - baseline
   ) %>%
@@ -186,6 +211,17 @@ multi_proc_dendro_L2 <- function(s) {
 dendro_data_L2 <- map_dfr(series_ids, multi_proc_dendro_L2)
 
 pj_dendro_all <- dendro_data_L2
+
+
+pj_dendro_all |>
+  filter(series == "P21") |>
+  ggplot(aes(x = ts, y = twd)) +
+  geom_point()
+
+ggplotly(pj_dendro_all |>
+  filter(series == "P21") |>
+  ggplot(aes(x = ts, y = twd)) +
+  geom_point())
 
 write.csv(pj_dendro_all, file = here("data/processed/pj_dendro.csv"))
 

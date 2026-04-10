@@ -3,13 +3,16 @@
 
 library(tidyverse)
 library(here)
+library(janitor)
+
+source(here("code/supp/mpj_time_utils.R"))
 
 climate24_dat <- read_csv(here("data/raw/US-Mpj_2024_gapfilled.txt")) |>
   clean_names() |>
   slice(-1) |>
   mutate(
-    timestamp_start = ymd_hm(timestamp_start),
-    timestamp_end = ymd_hm(timestamp_end),
+    timestamp_start = parse_mpj_wall_time(timestamp_start),
+    timestamp_end = parse_mpj_wall_time(timestamp_end),
     across(-c(timestamp_start, timestamp_end), parse_number),
     across(where(is.numeric), ~ na_if(., -9999)),
     date = as_date(timestamp_start),
@@ -38,8 +41,8 @@ climate25_dat <- read_csv(here("data/raw/US-Mpj_2025_gapfilled.txt")) |>
   clean_names() |>
   slice(-1) |>
   mutate(
-    timestamp_start = ymd_hm(timestamp_start),
-    timestamp_end = ymd_hm(timestamp_end),
+    timestamp_start = parse_mpj_wall_time(timestamp_start),
+    timestamp_end = parse_mpj_wall_time(timestamp_end),
     across(-c(timestamp_start, timestamp_end), parse_number),
     across(where(is.numeric), ~ na_if(., -9999)),
     date = as_date(timestamp_start),

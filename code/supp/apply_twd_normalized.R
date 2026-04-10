@@ -2,16 +2,19 @@
 
 suppressPackageStartupMessages({
   library(dplyr)
+  library(here)
   library(readr)
   library(lubridate)
   library(tidyr)
   library(ggplot2)
 })
 
+source(here("code/supp/mpj_time_utils.R"))
+
 args <- commandArgs(trailingOnly = TRUE)
 input_path <- if (length(args) >= 1) args[[1]] else "data/processed/pj_dendro.csv"
 output_path <- if (length(args) >= 2) args[[2]] else "data/processed/pj_dendro_twdnorm_daily.csv"
-tz_local <- if (length(args) >= 3) args[[3]] else "America/Denver"
+tz_local <- if (length(args) >= 3) args[[3]] else MPJ_FIXED_TZ
 plot_dir <- if (length(args) >= 4) args[[4]] else file.path(dirname(output_path), "plots")
 
 stop_if_missing <- function(path) {
@@ -29,15 +32,10 @@ pick_col <- function(nms, candidates, label) {
 }
 
 parse_ts <- function(x, tz_local) {
-  x <- as.character(x)
-  parsed <- suppressWarnings(ymd_hms(x, tz = tz_local, quiet = TRUE))
+  parsed <- parse_mpj_wall_time(x, tz = tz_local)
   idx_na <- is.na(parsed)
   if (any(idx_na)) {
-    parsed[idx_na] <- suppressWarnings(ymd_hm(x[idx_na], tz = tz_local, quiet = TRUE))
-  }
-  idx_na <- is.na(parsed)
-  if (any(idx_na)) {
-    parsed[idx_na] <- suppressWarnings(ymd(x[idx_na], tz = tz_local, quiet = TRUE))
+    parsed[idx_na] <- suppressWarnings(ymd(normalize_mpj_time_string(x[idx_na]), tz = tz_local, quiet = TRUE))
   }
   parsed
 }
